@@ -1,4 +1,5 @@
 import os
+import base64
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
@@ -7,10 +8,17 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from core.state import AgentState
 from core.tools import get_tools, get_browser
 
+from core.knowledge import KnowledgeManager
+
 class Agent:
-    def __init__(self, model_provider="openai"):
+    def __init__(self, model_provider="openai", project_name=None):
         self.tools = get_tools()
         self.browser = get_browser()
+        self.knowledge = None
+        self.screenshot_cnt = 0
+        
+        if project_name:
+            self.knowledge = KnowledgeManager(project_name)
         
         # Initialize Model
         if model_provider == "openai":
@@ -19,6 +27,8 @@ class Agent:
             self.model = ChatAnthropic(model="claude-3-5-sonnet-20240620", temperature=0)
         else:
             raise ValueError("Invalid model provider")
+        
+        print("Model initialized")
 
         self.model = self.model.bind_tools(self.tools)
 
@@ -42,6 +52,7 @@ class Agent:
         workflow.add_edge("tools", "agent")
         
         self.app = workflow.compile()
+        print("Agent initialized")
 
     def should_continue(self, state: AgentState):
         messages = state['messages']
@@ -57,24 +68,35 @@ class Agent:
         return "continue"
 
     def call_model(self, state: AgentState):
+        print("Call Model Invoked")
         messages = state['messages']
         
         # 1. Capture State (Eyes)
-        # Only capture if we are not just returning from a tool execution 
-        # (Optimization: In a real loop we might want to see the result of the action immediately)
-        # For this prototype, we capture every time the model thinks.
         if self.browser.page:
             print("Capturing state...")
             vision_state = self.browser.capture_state()
             screenshot = vision_state['screenshot']
+            #save all screenshots in a folder without getting permission error
+            with open(f"screenshots/screenshot_{self.screenshot_cnt}.png", "wb") as f:
+                f.write(base64.b64decode(screenshot)) 
+            self.screenshot_cnt += 1
+
             items = vision_state['items']
             
             # Create System Message with Context
-            # We format the item map as text for the LLM
             item_text = "\n".join([
                 f"ID: {i['id']} | Tag: {i['tag']} | Text: {i['text']}" 
                 for i in items
             ])
+            
+            # Get Project Knowledge
+            knowledge_context = ""
+            if self.knowledge:
+                k_text = self.knowledge.get_knowledge()
+                creds = self.knowledge.config.get('credentials', {})
+                c_text = f"CREDENTIALS: {creds}" if creds else ""
+                
+                knowledge_context = f"\nPROJECT KNOWLEDGE:\n{k_text}\n\n{c_text}\n"
             
             system_prompt = f"""
             You are an autonomous QA Agent.
@@ -83,14 +105,21 @@ class Agent:
             You have access to a browser.
             The current page has been analyzed and interactive elements are marked with numeric IDs.
             
+            {knowledge_context}
+            
             INTERACTIVE ELEMENTS:
             {item_text}
             
             INSTRUCTIONS:
             1. Analyze the user's goal and the list of elements.
-            2. Decide which element to interact with.
-            3. Call the appropriate tool (click_element, type_text, etc.) using the ID.
-            4. If the goal is met, call the 'done' tool.
+            2. Consult the Project Knowledge for hints (e.g., credentials, flow descriptions).
+            3. VERIFICATION: Check if the *previous* action (if any) succeeded. 
+               - Did the page change as expected?
+               - Did the element react?
+               - If it failed, try a DIFFERENT strategy (e.g., different element, different tool).
+            4. Decide which element to interact with.
+            5. Call the appropriate tool (click_element, type_text, etc.) using the ID.
+            6. If the goal is met, call the 'done' tool.
             """
             
             # Add image to the message (Multimodal)
@@ -124,11 +153,34 @@ class Agent:
             response = self.model.invoke(full_history)
         else:
             # Browser not started yet, just let the model decide to navigate
-            response = self.model.invoke(messages)
+            print("Browser not started yet, just let the model decide to navigate")
+            
+            # Helper to get project context
+            knowledge_context = ""
+            if self.knowledge:
+                k_text = self.knowledge.get_knowledge()
+                creds = self.knowledge.config.get('credentials', {})
+                c_text = f"CREDENTIALS: {creds}" if creds else ""
+                knowledge_context = f"\nPROJECT KNOWLEDGE:\n{k_text}\n\n{c_text}\n"
+
+            initial_prompt = f"""
+            You are an autonomous QA Agent.
+            Your goal is to accomplish the user's objective on the web page.
+            
+            {knowledge_context}
+            
+            Current State: The browser is not open.
+            INSTRUCTIONS:
+            1. Analyze the user's goal.
+            2. Call the 'navigate' tool to go to the correct URL (check Project Knowledge for base URL).
+            """
+            
+            response = self.model.invoke([SystemMessage(content=initial_prompt)] + messages)
 
         return {"messages": [response]}
 
     def tool_node(self, state: AgentState):
+        print("Tool Node Invoked")
         messages = state['messages']
         last_message = messages[-1]
         
@@ -137,11 +189,18 @@ class Agent:
             tool_name = tool_call['name']
             tool_args = tool_call['args']
             
-            # Find and invoke tool
+            # Find tool
             tool = next(t for t in self.tools if t.name == tool_name)
-            result = tool.invoke(tool_args)  # Execute the tool to get the result
             
-            # Add tool output as a ToolMessage (NOT as a raw string)
+            try:
+                # Execute tool
+                result = tool.invoke(tool_args)
+            except Exception as e:
+                result = f"Error executing tool {tool_name}: {str(e)}"
+            
+            # Add tool output message
+            # (In a real implementation we need to construct ToolMessage properly)
+            # For this prototype we rely on LangGraph's built-in handling or manual construction
             from langchain_core.messages import ToolMessage
             outputs.append(ToolMessage(tool_call_id=tool_call['id'], content=str(result)))
             

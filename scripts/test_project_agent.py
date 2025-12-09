@@ -8,16 +8,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from core.agent import Agent
 
-# Load env vars (API Keys)
+# Load env vars
 load_dotenv()
 
 def main():
-    print("Initializing Agent...")
-    # You can switch to 'anthropic' if you have that key
-    # https://docs.langchain.com/oss/python/langchain/agents
-    agent = Agent(model_provider="openai") 
+    print("Initializing Agent with Project 'saucedemo'...")
+    agent = Agent(model_provider="openai", project_name="saucedemo") 
     
-    goal = "Go to https://saucedemo.com, Login as standard_user(username: standard_user and password: secret_sauce) and add the first item to the cart."
+    # Note: We don't provide credentials here. The agent must find them in the Project Knowledge.
+    goal = "Go to the base url and login as a standard user."
     print(f"Goal: {goal}")
     
     initial_state = {
@@ -31,7 +30,7 @@ def main():
     for event in agent.app.stream(initial_state):
         for key, value in event.items():
             print(f"\n--- Node: {key} ---")
-            print(value) # Verbose logging
+            # print(value)
 
 if __name__ == "__main__":
     main()
